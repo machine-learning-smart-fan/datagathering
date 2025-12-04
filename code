@@ -1,0 +1,206 @@
+#include <Wire.h>
+#include <INA219.h>
+#include <LiquidCrystal_I2C.h>
+
+// ================= 1. 핀 번호 설정 =================
+const int PIN_MOSFET = 2;   
+const int PIN_PWM = 5;      
+const int PIN_DIR = 6;      
+
+// LCD & 센서
+LiquidCrystal_I2C lcd(0x27, 16, 2); 
+INA219 ina(0x40);               
+
+// ================= 2. 속도 설정 =================
+const int SPEED_OFF = 0;
+const int SPEED_1   = 100;
+const int SPEED_2   = 170;
+const int SPEED_3   = 255;
+
+// ================= 3. 자동화 설정 =================
+
+const int TARGET_ROWS_PER_LEVEL = 1000; 
+
+
+const unsigned long WORK_TIME_LIMIT = 180000; 
+const unsigned long REST_TIME_DURATION = 240000; 
+
+// 상태 변수
+int currentStepIndex = 0;       
+int targetLevelOrder[4] = {2,1 ,0 ,3 }; 
+int collectedCount = 0;         
+unsigned long workStartTime = 0; 
+
+// 워밍업 관련
+bool isWarmingUp = true; 
+unsigned long warmupStartTime = 0;
+const unsigned long WARMUP_DURATION = 10000; 
+
+// ================= 4. 함수 정의 =================
+
+// [모터 제어 함수]
+void controlFan(int speed) {
+  digitalWrite(PIN_DIR, HIGH);      
+  analogWrite(PIN_PWM, 255 - speed); 
+}
+
+// [LCD 업데이트 함수]
+void updateLCD(int level, int count, float current_mA, String status) {
+  lcd.setCursor(0, 0);
+  lcd.print("L"); lcd.print(level);
+  lcd.print(" C:"); lcd.print(count);
+  
+  lcd.print(" I:"); 
+  lcd.print((int)current_mA); lcd.print("mA");
+  
+  lcd.setCursor(0, 1);
+  lcd.print(status); 
+  for(int i=status.length(); i<16; i++) lcd.print(" ");
+}
+
+void setup() {
+  Serial.begin(9600);
+  Wire.begin();
+
+  pinMode(PIN_MOSFET, OUTPUT);
+  pinMode(PIN_PWM, OUTPUT);
+  pinMode(PIN_DIR, OUTPUT);
+
+  digitalWrite(PIN_MOSFET, HIGH);
+  digitalWrite(PIN_DIR, HIGH);    
+  analogWrite(PIN_PWM, 255);       
+
+  lcd.init();
+  lcd.backlight();
+  
+  if (!ina.begin()) {
+    lcd.clear(); lcd.print("INA219 Error"); while(1);
+  }
+  ina.setMaxCurrentShunt(2.5, 0.1);
+
+  // 시리얼 헤더 출력
+  Serial.println("Current,Level"); 
+
+  // 시작 카운트다운
+  for(int i=5; i>0; i--) {
+    lcd.clear(); lcd.print("Auto Start in "); lcd.print(i);
+    delay(1000);
+  }
+  
+  workStartTime = millis();
+  warmupStartTime = millis();
+  isWarmingUp = true;
+  
+  // 첫 번째 단계(2단) 시작
+  controlFan(SPEED_2); 
+}
+
+void loop() {
+  int currentLevel = targetLevelOrder[currentStepIndex]; 
+
+  // 1. 종료 체크
+  if (currentStepIndex > 3) {
+    controlFan(SPEED_OFF); 
+    lcd.clear(); lcd.print("ALL DONE!"); 
+    lcd.setCursor(0,1); lcd.print("Data Collected");
+    while(1); 
+  }
+
+  // 2. 휴식 타임 체크
+  if (millis() - workStartTime > WORK_TIME_LIMIT) {
+    controlFan(SPEED_OFF); 
+    
+    unsigned long restStart = millis();
+    while (millis() - restStart < REST_TIME_DURATION) {
+      unsigned long remainTime = REST_TIME_DURATION - (millis() - restStart);
+      int remainMin = remainTime / 60000;
+      int remainSec = (remainTime % 60000) / 1000;
+      
+      String timeStr = "Cooling: " + String(remainMin) + "m " + String(remainSec) + "s";
+      updateLCD(currentLevel, collectedCount, 0, timeStr);
+      delay(1000);
+    }
+    
+    // 복귀
+    if (currentLevel == 0) controlFan(SPEED_OFF);
+    else if (currentLevel == 1) controlFan(SPEED_1);
+    else if (currentLevel == 2) controlFan(SPEED_2);
+    else if (currentLevel == 3) controlFan(SPEED_3);
+    
+    workStartTime = millis(); 
+    warmupStartTime = millis(); 
+    isWarmingUp = true;
+  }
+
+  // [추가] 워밍업 체크 (단계 변경 직후 10초간 데이터 버림)
+  if (isWarmingUp) {
+    long elapsed = millis() - warmupStartTime;
+    if (elapsed < WARMUP_DURATION) {
+      String status = "WarmUp: " + String((WARMUP_DURATION - elapsed)/1000) + "s";
+      updateLCD(currentLevel, collectedCount, ina.getCurrent_mA(), status);
+      return; 
+    } else {
+      isWarmingUp = false; 
+    }
+  }
+
+  // 3. 데이터 수집 (샘플 개수 기반 평균)
+  
+  float total_mA = 0;
+  long sampleCount = 0;
+  
+  
+  long samplesTarget = (currentLevel == 2) ? 6000 : 2000;
+  
+  // 측정 중 표시
+  if (millis() % 1000 == 0) updateLCD(currentLevel, collectedCount, 0, "Measuring...");
+
+  while (sampleCount < samplesTarget) {
+    total_mA += ina.getCurrent_mA();
+    sampleCount++;
+    
+    // LCD 갱신
+    if (sampleCount % 500 == 0) { 
+       updateLCD(currentLevel, collectedCount, total_mA/sampleCount, "Measuring...");
+    }
+    
+    // 랜덤 지연 (비트 현상 방지)
+    delayMicroseconds(random(100, 2000)); 
+  }
+
+  if (sampleCount > 0) {
+    float average_mA = total_mA / sampleCount;
+
+    // [시리얼 출력] 오직 전류와 레벨만! (CSV용)
+    Serial.print(average_mA);
+    Serial.print(",");
+    Serial.println(currentLevel);
+
+    collectedCount++; 
+    updateLCD(currentLevel, collectedCount, average_mA, "Recorded OK");
+  }
+
+  // 4. 다음 단계로 이동
+  if (collectedCount >= TARGET_ROWS_PER_LEVEL) { 
+    currentStepIndex++; 
+    collectedCount = 0; 
+    workStartTime = millis(); 
+    
+    if (currentStepIndex <= 3) {
+        int nextLevel = targetLevelOrder[currentStepIndex];
+        if (nextLevel == 0) controlFan(SPEED_OFF);
+        else if (nextLevel == 1) controlFan(SPEED_1);
+        else if (nextLevel == 2) controlFan(SPEED_2);
+        else if (nextLevel == 3) controlFan(SPEED_3);
+    } else {
+        controlFan(SPEED_OFF); 
+    }
+
+    // 단계 변경 시 다시 워밍업
+    warmupStartTime = millis();
+    isWarmingUp = true;
+
+    lcd.setCursor(0, 1); lcd.print("Level Changing..");
+    delay(3000); 
+  }
+}
