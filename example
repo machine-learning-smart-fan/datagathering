@@ -1,0 +1,350 @@
+from copy import deepcopy
+from sklearn.metrics import log_loss, accuracy_score, classification_report, confusion_matrix
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import SGDClassifier
+from sklearn.model_selection import train_test_split
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# ==========================================
+# 1. 깃허브에서 데이터 불러오기
+# ==========================================
+url = "https://raw.githubusercontent.com/machine-learning-smart-fan/datagathering/main/newcode"
+data_df = pd.read_csv(url, header=None, names=['current', 'level'])
+
+# 데이터 확인
+print("=" * 60)
+print("📊 전체 데이터 정보")
+print("=" * 60)
+print(f"전체 데이터 개수: {len(data_df)}")
+print(f"\n각 레벨별 데이터 개수:")
+print(data_df['level'].value_counts().sort_index())
+print("\n각 레벨별 전류 평균:")
+for level in sorted(data_df['level'].unique()):
+    mean_current = data_df[data_df['level'] == level]['current'].mean()
+    std_current = data_df[data_df['level'] == level]['current'].std()
+    print(f"Level {level}: 평균 {mean_current:.2f} mA (표준편차: {std_current:.2f})")
+
+# ==========================================
+# 2. 데이터 분리 (학습 80%, 테스트 20%)
+# ==========================================
+X = data_df[['current']].values
+y = data_df['level'].values
+
+# 80% 학습, 20% 테스트 (stratify로 각 레벨별로 균등하게 분리)
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
+)
+
+print("\n" + "=" * 60)
+print("🔀 데이터 분할 결과")
+print("=" * 60)
+print(f"학습 데이터: {len(X_train)}개 (80%)")
+print(f"테스트 데이터: {len(X_test)}개 (20%)")
+print(f"\n테스트 데이터 레벨별 개수:")
+unique, counts = np.unique(y_test, return_counts=True)
+for level, count in zip(unique, counts):
+    print(f"  Level {level}: {count}개")
+
+# 스케일링
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_test_scaled = scaler.transform(X_test)
+
+# ==========================================
+# 3. SGD 분류기 학습
+# ==========================================
+sgd_clf = SGDClassifier(
+    loss='log_loss', 
+    penalty=None, 
+    eta0=0.002, 
+    learning_rate='constant',
+    random_state=42
+)
+
+n_epochs = 400
+best_valid_loss = float('inf')
+train_errors, test_errors = [], []
+best_model = None
+best_epoch = 0
+
+classes = np.unique(y)
+
+print("\n" + "=" * 60)
+print("🎓 모델 학습 시작")
+print("=" * 60)
+
+for epoch in range(n_epochs):
+    sgd_clf.partial_fit(X_train_scaled, y_train, classes=classes)
+    
+    y_train_proba = sgd_clf.predict_proba(X_train_scaled)
+    train_error = log_loss(y_train, y_train_proba)
+    train_errors.append(train_error)
+    
+    y_test_proba = sgd_clf.predict_proba(X_test_scaled)
+    test_error = log_loss(y_test, y_test_proba)
+    test_errors.append(test_error)
+    
+    if test_error < best_valid_loss:
+        best_valid_loss = test_error
+        best_model = deepcopy(sgd_clf)
+        best_epoch = epoch
+    
+    if (epoch + 1) % 100 == 0:
+        print(f"Epoch {epoch+1}/{n_epochs} - Train Loss: {train_error:.4f}, Test Loss: {test_error:.4f}")
+
+print(f"\n✅ 학습 완료! Best Epoch: {best_epoch}")
+
+# ==========================================
+# 4. 테스트 데이터로 예측 및 결과 분석
+# ==========================================
+y_test_pred = best_model.predict(X_test_scaled)
+
+# 맞춘 개수, 틀린 개수 계산
+correct_count = np.sum(y_test == y_test_pred)
+wrong_count = np.sum(y_test != y_test_pred)
+accuracy = correct_count / len(y_test) * 100
+
+print("\n" + "=" * 60)
+print(f"🎯 테스트 결과 ({len(y_test)}개 테스트)")
+print("=" * 60)
+print(f"✅ 맞춘 개수: {correct_count}개")
+print(f"❌ 틀린 개수: {wrong_count}개")
+print(f"📊 정확도: {accuracy:.2f}%")
+
+# ==========================================
+# 5. 레벨별 상세 결과
+# ==========================================
+print("\n" + "=" * 60)
+print("📋 레벨별 상세 결과")
+print("=" * 60)
+
+level_names = {0: '정지(0단)', 1: '1단', 2: '2단', 3: '3단'}
+
+for level in sorted(np.unique(y_test)):
+    mask = y_test == level
+    level_total = np.sum(mask)
+    level_correct = np.sum((y_test == y_test_pred) & mask)
+    level_wrong = level_total - level_correct
+    level_accuracy = (level_correct / level_total * 100) if level_total > 0 else 0
+    
+    print(f"\n{level_names[level]}:")
+    print(f"  전체: {level_total}개")
+    print(f"  맞춤: {level_correct}개")
+    print(f"  틀림: {level_wrong}개")
+    print(f"  정확도: {level_accuracy:.2f}%")
+
+# ==========================================
+# 6. 틀린 예측 상세 분석
+# ==========================================
+wrong_indices = np.where(y_test != y_test_pred)[0]
+
+if len(wrong_indices) > 0:
+    print("\n" + "=" * 60)
+    print(f"❌ 틀린 예측 상세 분석 (총 {len(wrong_indices)}개)")
+    print("=" * 60)
+    
+    # 틀린 예측이 너무 많으면 처음 10개만 출력
+    display_count = min(10, len(wrong_indices))
+    for i, idx in enumerate(wrong_indices[:display_count]):
+        actual_level = y_test[idx]
+        predicted_level = y_test_pred[idx]
+        current_value = X_test[idx][0]
+        
+        print(f"\n틀린 예측 #{i+1}:")
+        print(f"  전류값: {current_value:.2f} mA")
+        print(f"  실제 레벨: {level_names[actual_level]}")
+        print(f"  예측 레벨: {level_names[predicted_level]}")
+    
+    if len(wrong_indices) > 10:
+        print(f"\n... 외 {len(wrong_indices) - 10}개 더 있음")
+else:
+    print("\n" + "=" * 60)
+    print("🎉 완벽합니다! 모든 테스트 데이터를 정확히 예측했습니다!")
+    print("=" * 60)
+
+# ==========================================
+# 7. Confusion Matrix
+# ==========================================
+cm = confusion_matrix(y_test, y_test_pred)
+print("\n" + "=" * 60)
+print("📊 Confusion Matrix (혼동 행렬)")
+print("=" * 60)
+print("           예측→")
+print("실제↓     0단    1단    2단    3단")
+for i, level in enumerate(sorted(np.unique(y_test))):
+    row_str = f"{level_names[level]:8} "
+    for j in range(len(cm[i])):
+        row_str += f"{cm[i][j]:6} "
+    print(row_str)
+
+# ==========================================
+# 8. 모델의 가중치와 최종 분류 공식 출력
+# ==========================================
+print("\n" + "=" * 60)
+print("⚙️ 모델의 가중치와 분류 공식")
+print("=" * 60)
+
+# 스케일링 파라미터
+print("\n[1] StandardScaler 파라미터:")
+print(f"  평균 (mean): {scaler.mean_[0]:.6f}")
+print(f"  표준편차 (scale): {scaler.scale_[0]:.6f}")
+print(f"\n  스케일링 공식: X_scaled = (X - {scaler.mean_[0]:.6f}) / {scaler.scale_[0]:.6f}")
+
+# 모델 가중치와 절편
+print("\n[2] SGD Classifier 가중치와 절편:")
+print(f"  모델 클래스: {best_model.classes_}")
+
+weights = best_model.coef_
+intercepts = best_model.intercept_
+
+for i, level in enumerate(best_model.classes_):
+    print(f"\n  Level {level} ({level_names[level]}):")
+    print(f"    가중치 (w): {weights[i][0]:.6f}")
+    print(f"    절편 (b): {intercepts[i]:.6f}")
+
+# 최종 분류 공식
+print("\n[3] 최종 분류 공식 (Logistic Regression - One-vs-Rest):")
+print("\n각 클래스의 점수 계산:")
+for i, level in enumerate(best_model.classes_):
+    w = weights[i][0]
+    b = intercepts[i]
+    mean = scaler.mean_[0]
+    scale = scaler.scale_[0]
+    
+    print(f"\nLevel {level} ({level_names[level]}):")
+    print(f"  score_{level} = w * X_scaled + b")
+    print(f"  score_{level} = {w:.6f} * ((전류 - {mean:.6f}) / {scale:.6f}) + {b:.6f}")
+    
+    # 간소화된 공식
+    final_w = w / scale
+    final_b = b - (w * mean / scale)
+    print(f"  ⟹ score_{level} = {final_w:.6f} * 전류 + {final_b:.6f}")
+
+print("\n최종 예측:")
+print("  각 레벨의 score를 계산한 후,")
+print("  softmax 함수를 적용하여 확률로 변환하고,")
+print("  가장 높은 확률을 가진 레벨을 최종 예측값으로 선택합니다.")
+
+print("\n  P(level_i) = exp(score_i) / Σ exp(score_j)")
+print("  predicted_level = argmax(P(level_0), P(level_1), P(level_2), P(level_3))")
+
+# ==========================================
+# 9. 실제 예측 예시
+# ==========================================
+print("\n" + "=" * 60)
+print("📝 실제 예측 예시")
+print("=" * 60)
+
+test_currents = [30, 75, 110, 156]
+
+for test_current in test_currents:
+    print(f"\n전류 = {test_current} mA 일 때:")
+    
+    # 스케일링
+    X_scaled = (test_current - scaler.mean_[0]) / scaler.scale_[0]
+    print(f"  1. 스케일링: ({test_current} - {scaler.mean_[0]:.2f}) / {scaler.scale_[0]:.2f} = {X_scaled:.6f}")
+    
+    # 각 레벨의 점수 계산
+    print(f"  2. 각 레벨의 점수 계산:")
+    scores = []
+    for i, level in enumerate(best_model.classes_):
+        score = weights[i][0] * X_scaled + intercepts[i]
+        scores.append(score)
+        print(f"     Level {level}: {weights[i][0]:.6f} * {X_scaled:.6f} + {intercepts[i]:.6f} = {score:.6f}")
+    
+    # Softmax 확률 계산
+    exp_scores = np.exp(scores)
+    probabilities = exp_scores / np.sum(exp_scores)
+    
+    print(f"  3. Softmax 확률:")
+    for i, level in enumerate(best_model.classes_):
+        print(f"     Level {level} ({level_names[level]}): {probabilities[i]*100:.2f}%")
+    
+    # 최종 예측
+    predicted_level = best_model.classes_[np.argmax(probabilities)]
+    print(f"  4. 최종 예측: Level {predicted_level} ({level_names[predicted_level]})")
+
+# ==========================================
+# 10. 시각화
+# ==========================================
+fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+# (1) 학습 곡선
+ax1 = axes[0, 0]
+ax1.annotate('Best model',
+             xy=(best_epoch, best_valid_loss),
+             xytext=(best_epoch, best_valid_loss + 0.05),
+             ha="center",
+             fontsize=10,
+             arrowprops=dict(facecolor='black', shrink=0.05, width=1.5))
+ax1.plot([0, len(test_errors)], [best_valid_loss, best_valid_loss], 
+         "k:", linewidth=2, label=f'Best Test Loss: {best_valid_loss:.4f}')
+ax1.plot(test_errors, "b-", linewidth=2, label="Test Loss")
+ax1.plot(train_errors, "r--", linewidth=2, label="Training Loss")
+ax1.plot(best_epoch, best_valid_loss, "bo", markersize=8)
+ax1.legend(loc="upper right")
+ax1.set_xlabel("Epoch")
+ax1.set_ylabel("Log Loss")
+ax1.set_title("Training and Test Loss")
+ax1.grid(True, alpha=0.3)
+
+# (2) 전류 분포 (학습 데이터)
+ax2 = axes[0, 1]
+for level in sorted(np.unique(y_train)):
+    level_data = X_train[y_train == level].flatten()
+    ax2.hist(level_data, bins=30, alpha=0.6, label=f'Level {level}')
+ax2.set_xlabel("Current (mA)")
+ax2.set_ylabel("Frequency")
+ax2.set_title("Training Data: Current Distribution by Level")
+ax2.legend()
+ax2.grid(True, alpha=0.3)
+
+# (3) Confusion Matrix 히트맵
+ax3 = axes[1, 0]
+level_labels = [level_names[i] for i in sorted(np.unique(y_test))]
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+            xticklabels=level_labels, yticklabels=level_labels, ax=ax3,
+            cbar_kws={'label': 'Count'})
+ax3.set_xlabel("Predicted Level")
+ax3.set_ylabel("True Level")
+ax3.set_title(f"Confusion Matrix\n(Accuracy: {accuracy:.2f}%)")
+
+# (4) 결정 경계 시각화
+ax4 = axes[1, 1]
+
+# 전류 범위 설정
+current_range = np.linspace(0, 200, 1000).reshape(-1, 1)
+current_scaled = scaler.transform(current_range)
+probabilities = best_model.predict_proba(current_scaled)
+
+for i, level in enumerate(best_model.classes_):
+    ax4.plot(current_range, probabilities[:, i], label=f'Level {level} ({level_names[level]})', linewidth=2)
+
+ax4.set_xlabel("Current (mA)")
+ax4.set_ylabel("Probability")
+ax4.set_title("Decision Boundaries (Probability)")
+ax4.legend()
+ax4.grid(True, alpha=0.3)
+ax4.set_xlim([0, 200])
+ax4.set_ylim([0, 1.05])
+
+plt.tight_layout()
+plt.show()
+
+# ==========================================
+# 11. 최종 요약
+# ==========================================
+print("\n" + "=" * 60)
+print("📝 최종 요약")
+print("=" * 60)
+print(f"총 데이터: {len(data_df)}개")
+print(f"학습 데이터: {len(X_train)}개 (80%)")
+print(f"테스트 데이터: {len(X_test)}개 (20%)")
+print(f"\n테스트 결과:")
+print(f"  ✅ 맞춘 개수: {correct_count}/{len(y_test)}개")
+print(f"  ❌ 틀린 개수: {wrong_count}/{len(y_test)}개")
+print(f"  📊 정확도: {accuracy:.2f}%")
+print("=" * 60)
