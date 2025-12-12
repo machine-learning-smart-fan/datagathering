@@ -1,0 +1,176 @@
+#include <Wire.h>
+#include <IRremote.h>
+#include <INA219.h>
+#include <LiquidCrystal_I2C.h> // LCD 라이브러리 추가
+
+// ================= 1. 핀 번호 설정 (5번, 6번) =================
+const int PIN_MOSFET = 2;   // 전체 전원
+const int PIN_PWM = 5;      // 선풍기 속도
+const int PIN_DIR = 6;      // 선풍기 방향
+const int PIN_IR = 7;       // 리모컨
+
+// LCD 객체 (주소 0x27 가정)
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// ================= 2. 리모컨 버튼 =================
+#define CMD_OK      0x1C
+#define CMD_STOP    0x19
+#define CMD_SPEED_1 0x45
+#define CMD_SPEED_2 0x46
+#define CMD_SPEED_3 0x47
+
+// ================= 3. 속도 설정 =================
+const int SPEED_OFF = 0;
+const int SPEED_1   = 100;
+const int SPEED_2   = 170;
+const int SPEED_3   = 255;
+
+// ================= 4. 변수 설정 =================
+INA219 ina(0x40);              
+bool isReady = false;          
+unsigned long lastTime = 0;    
+int currentLevel = 0;           // 현재 단계 (0~3)
+
+// ================= 5. 함수 정의 =================
+
+// [모터 제어 함수] Active Low 적용 (255 - speed)
+void controlFan(int speed) {
+  digitalWrite(PIN_DIR, HIGH);      
+  analogWrite(PIN_PWM, 255 - speed);
+}
+
+// [LCD 상태 표시 함수]
+void updateLCDStatus(int level, float current_mA) {
+  // LCD 1행: Level X 표시
+  lcd.setCursor(0, 0);
+  lcd.print("Level ");
+  lcd.print(level);
+  lcd.print("        "); // 공백으로 뒤의 잔상 제거
+
+  // LCD 2행: Current X mA 표시 (소수점 1자리까지)
+  lcd.setCursor(0, 1);
+  lcd.print("Current:");
+  lcd.print(current_mA, 1); // 소수점 첫째 자리까지 표시
+  lcd.print("mA  "); // 공백으로 뒤의 잔상 제거
+}
+
+void setup() {
+  Serial.begin(9600);
+  Wire.begin();
+
+  pinMode(PIN_MOSFET, OUTPUT);
+  pinMode(PIN_PWM, OUTPUT);
+  pinMode(PIN_DIR, OUTPUT);
+
+  // [초기 상태 설정 - Active Low]
+  digitalWrite(PIN_MOSFET, HIGH);
+  digitalWrite(PIN_DIR, HIGH);    
+  analogWrite(PIN_PWM, 255);      
+
+  IrReceiver.begin(PIN_IR, ENABLE_LED_FEEDBACK);
+
+  // LCD 초기화
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcd.print("System Initializing...");
+
+  if (!ina.begin()) {
+    lcd.clear();
+    lcd.print("INA219 Error!");
+    Serial.println("Error: INA219 not connected!");
+    while(1);
+  }
+  // INA219 설정
+  ina.setMaxCurrentShunt(2.5, 0.1);
+
+  lcd.clear();
+  lcd.print("Press [OK] to Start");
+  updateLCDStatus(currentLevel, 0.0); // 초기 상태 0단, 0.0mA 표시
+ 
+  // 데이터 헤더 출력
+  Serial.println("Time(ms),Level,BusVoltage(V),Current(mA)");
+}
+
+void loop() {
+  // ==========================================================
+  // [기능 1] 전류 데이터 수집 (1초 간격, 실시간)
+  // ==========================================================
+  if (millis() - lastTime >= 1000) {
+    lastTime = millis();
+   
+    float bus_V = ina.getBusVoltage();    // 전압
+    float current_mA = ina.getCurrent_mA(); // 전류
+   
+    // 📢 시리얼 모니터 출력
+    Serial.print("Time: ");
+    Serial.print(millis());
+    Serial.print(" ms | Level: ");
+    Serial.print(currentLevel);
+    Serial.print(" | Volt: ");
+    Serial.print(bus_V);
+    Serial.print(" V | Current: ");
+    Serial.print(current_mA);
+    Serial.println(" mA");
+
+    // 📢 LCD 실시간 갱신
+    updateLCDStatus(currentLevel, current_mA);
+  }
+
+  // ==========================================================
+  // [기능 2] 리모컨 제어
+  // ==========================================================
+  if (IrReceiver.decode()) {
+    uint16_t command = IrReceiver.decodedIRData.command;
+   
+    // 노이즈 필터
+    if (command == 0 || (IrReceiver.decodedIRData.flags & IRDATA_FLAGS_IS_REPEAT)) {
+      IrReceiver.resume();
+      return;
+    }
+
+    // [잠금 해제]
+    if (command == CMD_OK) {
+      isReady = true;
+      lcd.clear();
+      lcd.print("UNLOCKED!       ");
+      Serial.println(">>> [UNLOCKED] Ready!");
+    }
+   
+    // [속도 변경]
+    else if (isReady == true) {
+      int prevLevel = currentLevel; // 이전 레벨 저장
+     
+      if (command == CMD_STOP) {
+        controlFan(SPEED_OFF);
+        currentLevel = 0;
+        Serial.println(">>> Speed 0 (STOP)");
+        isReady = false; // 정지 후에는 다시 잠금
+      }
+      else if (command == CMD_SPEED_1) {
+        controlFan(SPEED_1);
+        currentLevel = 1;
+        Serial.println(">>> Speed 1");
+      }
+      else if (command == CMD_SPEED_2) {
+        controlFan(SPEED_2);
+        currentLevel = 2;
+        Serial.println(">>> Speed 2");
+      }
+      else if (command == CMD_SPEED_3) {
+        controlFan(SPEED_3);
+        currentLevel = 3;
+        Serial.println(">>> Speed 3");
+      }
+
+      // 레벨이 변경되었다면 LCD에 변경 메시지 출력 (잠시)
+      if (prevLevel != currentLevel) {
+        lcd.clear();
+        lcd.print("Level Changed to:");
+        lcd.setCursor(0, 1);
+        lcd.print(currentLevel);
+      }
+    }
+    IrReceiver.resume();
+  }
+}
