@@ -1,0 +1,281 @@
+#include <Wire.h>
+#include <INA219.h>
+#include <LiquidCrystal_I2C.h>
+
+// ================= 1. 핀 번호 설정 =================
+const int PIN_MOSFET = 2;   
+const int PIN_PWM = 5;      
+const int PIN_DIR = 6;      
+
+// LCD & 센서
+LiquidCrystal_I2C lcd(0x27, 16, 2); 
+INA219 ina(0x40);               
+
+// ================= 2. 속도 설정 =================
+const int SPEED_OFF = 0;
+const int SPEED_1   = 100;
+const int SPEED_2   = 170;
+const int SPEED_3   = 255;
+
+// ================= 3. 자동화 설정 =================
+const int TARGET_COUNT_PER_LEVEL = 10; // 500개 수집
+
+// 안전을 위해 작업 시간 단축 (2분 작업, 5분 휴식)
+const unsigned long WORK_TIME_LIMIT = 120000; 
+const unsigned long REST_TIME_DURATION = 300000; 
+
+// 상태 변수
+int currentStepIndex = 0;       
+int targetLevelOrder[4] = {2, 1, 0, 3}; // 작업 순서: 2 -> 1 -> 0 -> 3
+int collectedCount = 0;         
+unsigned long workStartTime = 0; 
+
+// [추가] 워밍업 상태 변수
+bool isWarmingUp = true; 
+unsigned long warmupStartTime = 0;
+const unsigned long WARMUP_DURATION = 5000; // 5초간 데이터 버림
+
+// 최적화 관련 변수 (에러 해결: 전역 변수로 선언)
+bool optimizationDone = false; 
+int bestSampleCount = 3000;    
+const int CASES[5] = {1000, 1500, 2000, 2500, 3000};
+const int NUM_CASES = 5;
+
+// ================= 4. 함수 정의 =================
+
+void controlFan(int speed) {
+  digitalWrite(PIN_DIR, HIGH);      
+  analogWrite(PIN_PWM, 255 - speed); 
+}
+
+void updateLCD(int level, int count, float current_mA, String status) {
+  lcd.setCursor(0, 0);
+  lcd.print("L"); lcd.print(level);
+  lcd.print(" C:"); lcd.print(count);
+  
+  lcd.print(" I:"); 
+  lcd.print((int)current_mA); lcd.print("mA");
+  
+  lcd.setCursor(0, 1);
+  lcd.print(status); 
+  for(int i=status.length(); i<16; i++) lcd.print(" ");
+}
+
+// [최적화 함수] - 3차 편차 알고리즘 적용
+void findBestSampleCount() {
+  lcd.clear();
+  lcd.setCursor(0, 0); lcd.print("Auto Optimizing");
+  lcd.setCursor(0, 1); lcd.print("Please Wait...");
+  
+  // 안정적인 부하인 2단으로 테스트
+  controlFan(SPEED_2);
+  delay(5000); // [수정] 최적화 전에도 5초간 충분히 대기
+
+  // 3차 편차 계산을 위한 4개 구간 합계 변수
+  double sumSet1[NUM_CASES] = {0}; // 0 ~ N
+  double sumSet2[NUM_CASES] = {0}; // N ~ 2N
+  double sumSet3[NUM_CASES] = {0}; // 2N ~ 3N
+  double sumSet4[NUM_CASES] = {0}; // 3N ~ 4N
+  
+  long sampleCounter = 0;
+  // 최대 샘플 수: 가장 긴 Case(3000)의 4배 = 12000개
+  long maxSamplesNeeded = CASES[NUM_CASES-1] * 4; 
+
+  while (sampleCounter < maxSamplesNeeded) {
+    float val = ina.getCurrent_mA();
+    
+    for(int i=0; i<NUM_CASES; i++) {
+      int N = CASES[i]; 
+      if (sampleCounter < N) sumSet1[i] += val;
+      else if (sampleCounter < N * 2) sumSet2[i] += val;
+      else if (sampleCounter < N * 3) sumSet3[i] += val;
+      else if (sampleCounter < N * 4) sumSet4[i] += val;
+    }
+    sampleCounter++;
+    // 측정 속도 조절 (랜덤 지연: 0.1ms ~ 0.5ms) - 12000개라 더 빠르게
+    delayMicroseconds(random(10, 500)); 
+  }
+
+  // 최적 Case 선정 (3차 편차 합계 최소화)
+  float minTotalDiff = 999999.0;
+  int bestIndex = 4; // 기본 3000개
+
+  for(int i=0; i<NUM_CASES; i++) {
+    int count = CASES[i];
+    float mean1 = sumSet1[i] / count;
+    float mean2 = sumSet2[i] / count;
+    float mean3 = sumSet3[i] / count;
+    float mean4 = sumSet4[i] / count;
+    
+    // 편차 계산
+    float diff1 = abs(mean1 - mean2);
+    float diff2 = abs(mean2 - mean3);
+    float diff3 = abs(mean3 - mean4);
+    
+    float totalDiff = diff1 + diff2 + diff3;
+
+    if (totalDiff < minTotalDiff) {
+      minTotalDiff = totalDiff;
+      bestIndex = i;
+    }
+  }
+
+  bestSampleCount = CASES[bestIndex];
+  optimizationDone = true;
+
+  // 결과 표시
+  lcd.clear();
+  lcd.setCursor(0, 0); lcd.print("Optimization OK");
+  lcd.setCursor(0, 1); lcd.print("Best: "); lcd.print(bestSampleCount);
+  
+  // 시리얼 로그
+  Serial.print("OPTIMIZATION_COMPLETE_BEST_SAMPLES:");
+  Serial.println(bestSampleCount);
+  
+  delay(3000); 
+  lcd.clear();
+}
+
+void setup() {
+  Serial.begin(9600);
+  Wire.begin();
+
+  pinMode(PIN_MOSFET, OUTPUT);
+  pinMode(PIN_PWM, OUTPUT);
+  pinMode(PIN_DIR, OUTPUT);
+
+  digitalWrite(PIN_MOSFET, HIGH);
+  digitalWrite(PIN_DIR, HIGH);    
+  analogWrite(PIN_PWM, 255);       
+
+  lcd.init();
+  lcd.backlight();
+  
+  if (!ina.begin()) {
+    lcd.clear(); lcd.print("INA219 Error"); while(1);
+  }
+  ina.setMaxCurrentShunt(2.5, 0.1);
+
+  // 시리얼 헤더 출력
+  Serial.println("Current,Level"); 
+
+  // 최적화 시작 (3차 편차 알고리즘 적용됨)
+  findBestSampleCount();
+  
+  // 본 작업 시작 준비
+  workStartTime = millis();
+  warmupStartTime = millis(); // [추가] 초기 워밍업 시간 설정
+  isWarmingUp = true;         // [추가] 워밍업 모드 시작
+  
+  // 첫 번째 단계(2단) 시작
+  controlFan(SPEED_2); 
+}
+
+void loop() {
+  int currentLevel = targetLevelOrder[currentStepIndex]; 
+
+  // 1. 종료 체크
+  if (currentStepIndex > 3) {
+    controlFan(SPEED_OFF); 
+    lcd.clear(); lcd.print("ALL DONE!"); 
+    lcd.setCursor(0,1); lcd.print("Data Collected");
+    while(1); 
+  }
+
+  // 2. 휴식 타임 체크
+  if (millis() - workStartTime > WORK_TIME_LIMIT) {
+    controlFan(SPEED_OFF); 
+    
+    unsigned long restStart = millis();
+    while (millis() - restStart < REST_TIME_DURATION) {
+      unsigned long remainTime = REST_TIME_DURATION - (millis() - restStart);
+      int remainMin = remainTime / 60000;
+      int remainSec = (remainTime % 60000) / 1000;
+      
+      String timeStr = "Cooling: " + String(remainMin) + "m " + String(remainSec) + "s";
+      updateLCD(currentLevel, collectedCount, 0, timeStr);
+      delay(1000);
+    }
+    
+    // 복귀
+    if (currentLevel == 0) controlFan(SPEED_OFF);
+    else if (currentLevel == 1) controlFan(SPEED_1);
+    else if (currentLevel == 2) controlFan(SPEED_2);
+    else if (currentLevel == 3) controlFan(SPEED_3);
+    
+    workStartTime = millis(); 
+    warmupStartTime = millis(); // [추가] 휴식 후 복귀 시에도 워밍업
+    isWarmingUp = true;
+  }
+
+  // [추가] 워밍업 체크 (돌입 전류 구간 스킵)
+  if (isWarmingUp) {
+    long elapsed = millis() - warmupStartTime;
+    if (elapsed < WARMUP_DURATION) {
+      // 남은 워밍업 시간 표시
+      String status = "WarmUp: " + String((WARMUP_DURATION - elapsed)/1000) + "s";
+      updateLCD(currentLevel, collectedCount, ina.getCurrent_mA(), status);
+      return; // 데이터 수집 안 하고 loop 재시작
+    } else {
+      isWarmingUp = false; // 워밍업 끝
+    }
+  }
+
+  // 3. 데이터 수집 (찾아낸 최적 개수만큼 평균 측정)
+  
+  float total_mA = 0;
+  long sampleCount = 0;
+  
+  // 최적 개수의 3배만큼 측정 (안정성 확보)
+  long targetSamples = bestSampleCount * 3; 
+  
+  // 측정 중 표시
+  if (millis() % 2000 == 0) updateLCD(currentLevel, collectedCount, 0, "Measuring...");
+
+  while (sampleCount < targetSamples) {
+    total_mA += ina.getCurrent_mA();
+    sampleCount++;
+    
+    // LCD 갱신 (너무 자주는 말고)
+    if (sampleCount % 1000 == 0) { 
+       updateLCD(currentLevel, collectedCount, total_mA/sampleCount, "Measuring...");
+    }
+    delayMicroseconds(random(100, 2000)); 
+  }
+
+  if (sampleCount > 0) {
+    float average_mA = total_mA / sampleCount;
+
+    // [시리얼 출력] 오직 전류와 레벨만!
+    Serial.print(average_mA);
+    Serial.print(",");
+    Serial.println(currentLevel);
+
+    collectedCount++; 
+    updateLCD(currentLevel, collectedCount, average_mA, "Recorded OK");
+  }
+
+  // 4. 다음 단계로 이동
+  if (collectedCount >= TARGET_COUNT_PER_LEVEL) {
+    currentStepIndex++; 
+    collectedCount = 0; 
+    workStartTime = millis(); 
+    
+    if (currentStepIndex <= 3) {
+        int nextLevel = targetLevelOrder[currentStepIndex];
+        if (nextLevel == 0) controlFan(SPEED_OFF);
+        else if (nextLevel == 1) controlFan(SPEED_1);
+        else if (nextLevel == 2) controlFan(SPEED_2);
+        else if (nextLevel == 3) controlFan(SPEED_3);
+    } else {
+        controlFan(SPEED_OFF); 
+    }
+
+    // 단계 변경 시에도 워밍업 설정
+    warmupStartTime = millis();
+    isWarmingUp = true;
+
+    lcd.setCursor(0, 1); lcd.print("Level Changing..");
+    delay(3000); 
+  }
+}
